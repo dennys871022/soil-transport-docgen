@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Streamlit 主程式：上傳聯單 CSV，自動產生三種 Word 報表並打包下載。
+支援：排除異常聯單（不列入清運數量）、Google 試算表自動記錄累計與異常紀錄。
 """
 
 import io
@@ -9,6 +10,7 @@ import zipfile
 import pandas as pd
 import streamlit as st
 
+import sheets
 from docgen import (
     CONTRACTOR_NAME,
     build_all_documents,
@@ -17,6 +19,7 @@ from docgen import (
     load_cumulative_state,
     prepare_dataframe,
     read_csv_any_encoding,
+    shorten_ticket,
     summarize_dates,
     summarize_months,
     _check_templates_exist,
@@ -33,6 +36,15 @@ except FileNotFoundError as e:
 st.title("🚛 有價土石方聯單 → Word 報表自動產生器")
 st.caption("上傳聯單 CSV，自動產生「每日出場紀錄」「統計月報表」「運送時間一覽表」三種 Word 文件")
 
+sheets_enabled = sheets.is_configured(st)
+spreadsheet = None
+if sheets_enabled:
+    try:
+        spreadsheet = sheets.get_spreadsheet(st)
+    except Exception as e:  # noqa: BLE001
+        sheets_enabled = False
+        st.warning(f"Google 試算表連線設定看起來有問題，暫時改用手動累計記錄檔模式。錯誤訊息：{e}")
+
 with st.sidebar:
     st.header("⚙️ 設定")
     engineering_name_override = st.text_input(
@@ -41,21 +53,33 @@ with st.sidebar:
     st.text_input("施工廠商", value=CONTRACTOR_NAME, disabled=True)
 
     st.markdown("---")
-    st.subheader("📌 累計記錄（期初累計自動接續）")
-    state_file = st.file_uploader(
-        "上傳「上次的累計記錄檔」(.json)，程式會自動接續計算，不用手動輸入期初累計",
-        type=["json"], key="state_file",
-    )
+    st.subheader("📌 累計記錄")
+
     cumulative_state = {}
-    if state_file is not None:
+    if sheets_enabled:
+        st.success("✅ 已連接 Google 試算表，累計數字會自動讀取與寫回，不需要手動上傳/下載記錄檔")
         try:
-            cumulative_state = load_cumulative_state(state_file)
-            st.success(f"已讀取累計記錄，共 {len(cumulative_state)} 個月份的資料")
+            cumulative_state = sheets.load_cumulative_from_sheet(spreadsheet)
             if cumulative_state:
+                st.caption("目前試算表上的累計：")
                 st.json(cumulative_state, expanded=False)
-        except ValueError as e:
-            st.error(str(e))
-            st.stop()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"讀取 Google 試算表累計資料失敗：{e}")
+    else:
+        st.caption("尚未設定 Google 試算表連線，使用手動上傳/下載累計記錄檔的方式（見 README 說明可改為自動連線）。")
+        state_file = st.file_uploader(
+            "上傳「上次的累計記錄檔」(.json)，程式會自動接續計算",
+            type=["json"], key="state_file",
+        )
+        if state_file is not None:
+            try:
+                cumulative_state = load_cumulative_state(state_file)
+                st.success(f"已讀取累計記錄，共 {len(cumulative_state)} 個月份的資料")
+                if cumulative_state:
+                    st.json(cumulative_state, expanded=False)
+            except ValueError as e:
+                st.error(str(e))
+                st.stop()
 
     monthly_cumulative_start = st.number_input(
         "若某個月份沒有累計記錄可以沿用，這個月要從多少開始累計？（新工程第一次使用時填這裡）",
@@ -69,7 +93,7 @@ with st.sidebar:
         "- CSV 中每一個「年-月」都會產生一份「統計月報表」\n"
         "- 檢查項目 4 欄：狀態＝已完成 → 自動打勾\n"
         "- 運送數量：優先採用「實際出土量」，缺值則用「載運土方量」\n"
-        "- 月報表的憑證序號會自動省略共同前綴，只顯示「起始 ~ 結束」\n"
+        "- 月報表的憑證序號會自動省略共同前綴，只顯示後4碼「起始 ~ 結束」\n"
     )
 
 uploaded_file = st.file_uploader("上傳聯單資料 CSV 檔", type=["csv"])
@@ -105,19 +129,55 @@ st.dataframe(
     height=280,
 )
 
+# ---------------------------------------------------------------------------
+# 排除異常聯單（例如退車、拒收）
+# ---------------------------------------------------------------------------
+st.subheader("🚫 排除異常聯單（退車 / 拒收，不列入清運數量）")
+st.caption(
+    "選擇這次要排除的聯單。每日出場紀錄仍會正常顯示這一列（因為車輛確實有出場）；"
+    "但運送時間一覽表只會留出場時間，入場時間與數量留空，並在土資場名稱欄改填你輸入的原因；"
+    "統計月報表會扣掉這台的數量，並在備註欄註明原因與聯單號碼；所有總計/累計也都不會計入。"
+)
+
+ticket_options = df["聯單序號"].astype(str).tolist()
+ticket_labels = {}
+for t, (_, row) in zip(ticket_options, df.iterrows()):
+    out_time = row['出場日期時間'].strftime('%H:%M') if pd.notna(row['出場日期時間']) else ''
+    ticket_labels[t] = f"{shorten_ticket(t)}｜{row['出場車號']}｜{row['日期']} {out_time}"
+
+selected_tickets = st.multiselect(
+    "選擇要排除的聯單",
+    options=ticket_options,
+    format_func=lambda t: ticket_labels.get(t, t),
+)
+
+exclude_map = {}
+if selected_tickets:
+    st.markdown("**請填寫每一筆的排除原因：**")
+    for t in selected_tickets:
+        reason = st.text_input(
+            f"排除原因 — {ticket_labels.get(t, t)}",
+            key=f"reason_{t}",
+            placeholder="例如：液壓故障，土資場拒收",
+        )
+        exclude_map[t] = reason.strip()
+
 st.subheader("📅 將產生的檔案")
 st.write(f"每日出場紀錄 × {len(dates)}、運送時間一覽表 × {len(dates)}、統計月報表 × {len(months)}")
 st.write("日期：", "、".join(d.strftime("%Y-%m-%d") for d in dates))
 st.write("月份：", "、".join(m.strftime("%Y-%m") for m in months))
+if exclude_map:
+    st.write(f"本次排除 {len(exclude_map)} 筆聯單，不計入清運數量。")
 
 if st.button("🚀 產生 Word 文件", type="primary"):
     with st.spinner("處理中..."):
         try:
-            outputs, summary, updated_state = build_all_documents(
+            outputs, summary, updated_state, excluded_log = build_all_documents(
                 raw_df,
                 engineering_name_override=engineering_name_override.strip(),
                 monthly_cumulative_start=monthly_cumulative_start,
                 cumulative_state=cumulative_state,
+                exclude_map=exclude_map,
             )
         except Exception as e:  # noqa: BLE001
             st.error(f"產生文件時發生錯誤：{e}")
@@ -129,25 +189,42 @@ if st.button("🚀 產生 Word 文件", type="primary"):
         st.subheader("📊 每日彙總")
         st.dataframe(pd.DataFrame(summary), use_container_width=True)
 
-    st.subheader("📌 累計記錄（請下載保存，下次上傳新資料時再上傳回來，就能自動接續累計）")
+    if excluded_log:
+        st.subheader("🚫 本次排除的異常聯單")
+        st.dataframe(pd.DataFrame(excluded_log), use_container_width=True)
+
+    st.subheader("📌 累計記錄")
     st.json(updated_state, expanded=False)
-    st.download_button(
-        "⬇️ 下載本次累計記錄 (JSON)",
-        data=dump_cumulative_state(updated_state),
-        file_name="累計記錄.json",
-        mime="application/json",
-    )
+
+    if sheets_enabled:
+        try:
+            sheets.save_cumulative_to_sheet(spreadsheet, updated_state)
+            logged_count = sheets.log_excluded_tickets(spreadsheet, excluded_log)
+            msg = f"已自動寫回 Google 試算表「{sheets.CUMULATIVE_SHEET_NAME}」分頁"
+            if logged_count:
+                msg += f"，並新增 {logged_count} 筆異常退車紀錄到「{sheets.EXCLUDED_SHEET_NAME}」分頁"
+            st.success(msg + "。")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"寫入 Google 試算表失敗，請確認試算表已分享給服務帳號並給予編輯權限。錯誤訊息：{e}")
+    else:
+        st.download_button(
+            "⬇️ 下載本次累計記錄 (JSON)",
+            data=dump_cumulative_state(updated_state),
+            file_name="累計記錄.json",
+            mime="application/json",
+        )
 
     # 打包成 zip 供一次下載
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname, doc in outputs.items():
             zf.writestr(fname, doc_to_bytes(doc))
-        zf.writestr("累計記錄.json", dump_cumulative_state(updated_state))
+        if not sheets_enabled:
+            zf.writestr("累計記錄.json", dump_cumulative_state(updated_state))
     zip_buffer.seek(0)
 
     st.download_button(
-        "⬇️ 下載全部檔案 (ZIP，含 Word 文件與累計記錄)",
+        "⬇️ 下載全部檔案 (ZIP)",
         data=zip_buffer,
         file_name="土石方報表輸出.zip",
         mime="application/zip",
