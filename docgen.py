@@ -140,6 +140,51 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def format_ticket_range(tickets):
+    """把一組聯單序號簡化成『共同前綴_起始 ~ 結束』的格式。
+    例如 ['EYG10099EYG21699_B2-3_00000012', 'EYG10099EYG21699_B2-3_00000041']
+    會變成 'EYG10099EYG21699_B2-3_00000012 ~ 00000041'。
+    若只有一張，直接回傳該序號；若前綴不同（理論上同一天不會發生），退回顯示完整兩個序號。
+    """
+    if not tickets:
+        return ""
+    if len(tickets) == 1:
+        return tickets[0]
+    first, last = tickets[0], tickets[-1]
+    if "_" in first and "_" in last:
+        prefix1, suf1 = first.rsplit("_", 1)
+        prefix2, suf2 = last.rsplit("_", 1)
+        if prefix1 == prefix2:
+            return f"{prefix1}_{suf1} ~ {suf2}"
+    return f"{first} ~ {last}"
+
+
+# ---------------------------------------------------------------------------
+# 累計狀態（跨月/跨次上傳的期初累計記憶）
+# ---------------------------------------------------------------------------
+
+def load_cumulative_state(file_obj) -> dict:
+    """讀取先前下載的累計記錄 JSON 檔，回傳 {"YYYY-MM": 累計立方公尺} 的 dict。"""
+    import json
+    if file_obj is None:
+        return {}
+    try:
+        if hasattr(file_obj, "seek"):
+            file_obj.seek(0)
+        raw = file_obj.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8-sig")
+        data = json.loads(raw)
+        return {str(k): float(v) for k, v in data.items()}
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"累計記錄檔格式錯誤，請確認是上次程式產生的 JSON 檔：{e}")
+
+
+def dump_cumulative_state(state: dict) -> str:
+    import json
+    return json.dumps(state, ensure_ascii=False, indent=2)
+
+
 def summarize_dates(df: pd.DataFrame):
     """回傳資料中出現的所有日期（datetime.date），由小到大排序。"""
     return sorted(d for d in df["日期"].dropna().unique())
@@ -323,7 +368,7 @@ def generate_monthly_report(month_df: pd.DataFrame, year_month, engineering_name
         g = grouped.get(the_date)
         if g is not None and len(g):
             tickets = sorted(g["聯單序號"].astype(str).tolist())
-            ticket_range = tickets[0] if len(tickets) == 1 else f"{tickets[0]} ~ {tickets[-1]}"
+            ticket_range = format_ticket_range(tickets)
             count = len(g)
             qty_sum = g["數量"].sum()
             month_total += qty_sum
@@ -395,28 +440,39 @@ def generate_time_overview(day_df: pd.DataFrame, date, engineering_name: str) ->
 # ---------------------------------------------------------------------------
 
 def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
-                         monthly_cumulative_start: float = 0.0):
-    """回傳 dict: {輸出檔名: docx.Document}，以及一份處理摘要 list[dict]。"""
+                         monthly_cumulative_start: float = 0.0,
+                         cumulative_state: dict = None):
+    """回傳 (outputs, summary, updated_cumulative_state)。
+
+    cumulative_state: {"YYYY-MM": 該月已累計的立方公尺數}，用來記住「上一次/上個月」的累計。
+    若某個月份不在 cumulative_state 裡，就用 monthly_cumulative_start 當作該月的期初累計。
+    處理完成後會回傳更新過的 cumulative_state，供下次上傳新資料時繼續沿用（自動接續累計，
+    不需要每次都手動輸入期初累計）。
+    """
     _check_templates_exist()
     df = prepare_dataframe(df)
     outputs = {}
     summary = []
+    cumulative_state = dict(cumulative_state or {})
 
     # --- 每日出場紀錄 + 運送時間一覽表：逐日產生 ---
     dates = summarize_dates(df)
-    daily_cumulative = {}  # 每月累計，key=年月
     running_cum_by_month = {}
 
     for d in dates:
         day_df = df[df["日期"] == d].reset_index(drop=True)
         eng_name = engineering_name_override or day_df["工程名稱"].iloc[0]
         period = pd.Period(year=d.year, month=d.month, freq="M")
-        cum_before = running_cum_by_month.get(period, monthly_cumulative_start)
+        period_key = str(period)
+        if period not in running_cum_by_month:
+            running_cum_by_month[period] = cumulative_state.get(period_key, monthly_cumulative_start)
+        cum_before = running_cum_by_month[period]
 
         doc_daily, daily_total, cum_after = generate_daily_record(
             day_df, d, eng_name, cum_before
         )
         running_cum_by_month[period] = cum_after
+        cumulative_state[period_key] = cum_after
 
         fname_daily = f"每日出場紀錄_{d.strftime('%Y%m%d')}.docx"
         outputs[fname_daily] = doc_daily
@@ -432,18 +488,22 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
             "當月累計(m3)": cum_after,
         })
 
-    # --- 統計月報表：逐月產生（用同一組累計，銜接每日出場紀錄的累計）---
+    # --- 統計月報表：逐月產生 ---
     months = summarize_months(df)
     for m in months:
         month_df = df[df["年月"] == m].reset_index(drop=True)
         eng_name = engineering_name_override or month_df["工程名稱"].iloc[0]
+        month_qty = month_df["數量"].sum()
+        cum_end_of_month = running_cum_by_month.get(m, cumulative_state.get(str(m), monthly_cumulative_start))
+        cum_before_month = cum_end_of_month - month_qty
+
         doc_monthly, month_total, cum_after = generate_monthly_report(
-            month_df, m, eng_name, monthly_cumulative_start
+            month_df, m, eng_name, cum_before_month
         )
         fname_monthly = f"統計月報表_{m.strftime('%Y%m')}.docx"
         outputs[fname_monthly] = doc_monthly
 
-    return outputs, summary
+    return outputs, summary, cumulative_state
 
 
 def doc_to_bytes(doc: Document) -> bytes:
