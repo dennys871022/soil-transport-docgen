@@ -13,6 +13,8 @@ from docgen import (
     CONTRACTOR_NAME,
     build_all_documents,
     doc_to_bytes,
+    dump_cumulative_state,
+    load_cumulative_state,
     prepare_dataframe,
     read_csv_any_encoding,
     summarize_dates,
@@ -37,17 +39,37 @@ with st.sidebar:
         "工程名稱（留空則自動採用 CSV 內的工程名稱）", value=""
     )
     st.text_input("施工廠商", value=CONTRACTOR_NAME, disabled=True)
+
+    st.markdown("---")
+    st.subheader("📌 累計記錄（期初累計自動接續）")
+    state_file = st.file_uploader(
+        "上傳「上次的累計記錄檔」(.json)，程式會自動接續計算，不用手動輸入期初累計",
+        type=["json"], key="state_file",
+    )
+    cumulative_state = {}
+    if state_file is not None:
+        try:
+            cumulative_state = load_cumulative_state(state_file)
+            st.success(f"已讀取累計記錄，共 {len(cumulative_state)} 個月份的資料")
+            if cumulative_state:
+                st.json(cumulative_state, expanded=False)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
+
     monthly_cumulative_start = st.number_input(
-        "期初累計立方公尺（若這份 CSV 不是從月初開始，請填入之前已累計的數量）",
+        "若某個月份沒有累計記錄可以沿用，這個月要從多少開始累計？（新工程第一次使用時填這裡）",
         min_value=0.0, value=0.0, step=1.0,
     )
+
     st.markdown("---")
     st.markdown(
         "**產生規則**\n"
         "- CSV 中每一個「出場日期」都會各自產生一份「每日出場紀錄」與「運送時間一覽表」\n"
         "- CSV 中每一個「年-月」都會產生一份「統計月報表」\n"
         "- 檢查項目 4 欄：狀態＝已完成 → 自動打勾\n"
-        "- 運送數量：優先採用「實際出土量」，缺值則用「載運土方量」"
+        "- 運送數量：優先採用「實際出土量」，缺值則用「載運土方量」\n"
+        "- 月報表的憑證序號會自動省略共同前綴，只顯示「起始 ~ 結束」\n"
     )
 
 uploaded_file = st.file_uploader("上傳聯單資料 CSV 檔", type=["csv"])
@@ -91,10 +113,11 @@ st.write("月份：", "、".join(m.strftime("%Y-%m") for m in months))
 if st.button("🚀 產生 Word 文件", type="primary"):
     with st.spinner("處理中..."):
         try:
-            outputs, summary = build_all_documents(
+            outputs, summary, updated_state = build_all_documents(
                 raw_df,
                 engineering_name_override=engineering_name_override.strip(),
                 monthly_cumulative_start=monthly_cumulative_start,
+                cumulative_state=cumulative_state,
             )
         except Exception as e:  # noqa: BLE001
             st.error(f"產生文件時發生錯誤：{e}")
@@ -106,22 +129,32 @@ if st.button("🚀 產生 Word 文件", type="primary"):
         st.subheader("📊 每日彙總")
         st.dataframe(pd.DataFrame(summary), use_container_width=True)
 
+    st.subheader("📌 累計記錄（請下載保存，下次上傳新資料時再上傳回來，就能自動接續累計）")
+    st.json(updated_state, expanded=False)
+    st.download_button(
+        "⬇️ 下載本次累計記錄 (JSON)",
+        data=dump_cumulative_state(updated_state),
+        file_name="累計記錄.json",
+        mime="application/json",
+    )
+
     # 打包成 zip 供一次下載
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname, doc in outputs.items():
             zf.writestr(fname, doc_to_bytes(doc))
+        zf.writestr("累計記錄.json", dump_cumulative_state(updated_state))
     zip_buffer.seek(0)
 
     st.download_button(
-        "⬇️ 下載全部檔案 (ZIP)",
+        "⬇️ 下載全部檔案 (ZIP，含 Word 文件與累計記錄)",
         data=zip_buffer,
         file_name="土石方報表輸出.zip",
         mime="application/zip",
         type="primary",
     )
 
-    st.subheader("或單獨下載每份檔案")
+    st.subheader("或單獨下載每份 Word 檔案")
     for fname, doc in outputs.items():
         st.download_button(
             f"⬇️ {fname}",
