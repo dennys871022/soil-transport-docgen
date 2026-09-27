@@ -140,6 +140,18 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def apply_exclusions(df: pd.DataFrame, exclude_map: dict = None) -> pd.DataFrame:
+    """依聯單序號標記排除（異常退車等不列入清運數量的紀錄）。
+    exclude_map: {原始完整聯單序號: 排除原因文字}
+    加上兩個欄位：排除 (bool)、排除原因 (str)。
+    """
+    df = df.copy()
+    exclude_map = exclude_map or {}
+    df["排除"] = df["聯單序號"].astype(str).isin(exclude_map.keys())
+    df["排除原因"] = df["聯單序號"].astype(str).map(exclude_map).fillna("")
+    return df
+
+
 def shorten_ticket(ticket: str) -> str:
     """把單一聯單序號的流水號部分縮短成4位數。
     例如 'EYG10099EYG21699_B2-3_00000001' -> 'EYG10099EYG21699_B2-3_0001'
@@ -321,7 +333,8 @@ def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
         if i < n:
             r = day_df.iloc[i]
             qty = r["數量"]
-            daily_total += qty
+            if not r.get("排除", False):
+                daily_total += qty
             _set_cell_text(row.cells[0], str(i + 1))
             _set_cell_text(row.cells[1], shorten_ticket(r["聯單序號"]))
             _set_cell_text(row.cells[2], str(r["出場車號"]))
@@ -385,12 +398,23 @@ def generate_monthly_report(month_df: pd.DataFrame, year_month, engineering_name
             tickets = sorted(g["聯單序號"].astype(str).tolist())
             ticket_range = format_ticket_range(tickets)
             count = len(g)
-            qty_sum = g["數量"].sum()
+            included = g[~g["排除"]]
+            excluded = g[g["排除"]]
+            qty_sum = included["數量"].sum()
             month_total += qty_sum
             _set_cell_text(row.cells[1], ticket_range)
             _set_cell_text(row.cells[2], str(count))
             _set_cell_text(row.cells[3], f"{qty_sum:g}")
-            _set_cell_text(row.cells[4], "")
+            if len(excluded):
+                notes = []
+                for _, er in excluded.iterrows():
+                    notes.append(
+                        f"{shorten_ticket(er['聯單序號'])} 異常不列入計量"
+                        f"（{er['排除原因'] or '原因未填'}）"
+                    )
+                _set_cell_text(row.cells[4], "；".join(notes))
+            else:
+                _set_cell_text(row.cells[4], "")
         # 若當天沒有資料，保留原樣（空白）
 
     cumulative_after = cumulative_before + month_total
@@ -435,14 +459,24 @@ def generate_time_overview(day_df: pd.DataFrame, date, engineering_name: str) ->
             r = day_df.iloc[i]
             out_dt = r["出場日期時間"]
             in_dt = r["進場日期時間"]
+            is_excluded = bool(r.get("排除", False))
             _set_cell_text(row.cells[0], str(engineering_name))
             _set_cell_text(row.cells[1], str(r["出場車號"]))
             _set_cell_text(row.cells[2], out_dt.strftime("%Y.%m.%d") if pd.notna(out_dt) else "")
             _set_cell_text(row.cells[3], out_dt.strftime("%H:%M") if pd.notna(out_dt) else "")
-            _set_cell_text(row.cells[4], in_dt.strftime("%Y.%m.%d") if pd.notna(in_dt) else "")
-            _set_cell_text(row.cells[5], in_dt.strftime("%H:%M") if pd.notna(in_dt) else "")
-            _set_cell_text(row.cells[6], f"{r['數量']:g}")
-            _set_cell_text(row.cells[7], str(r.get("土資場名稱", "")))
+            if is_excluded:
+                # 異常退車：沒有實際入場，入場日期/時間與載運數量留空，
+                # 土資場名稱欄位改填使用者輸入的排除原因
+                _set_cell_text(row.cells[4], "")
+                _set_cell_text(row.cells[5], "")
+                _set_cell_text(row.cells[6], "")
+                reason = r.get("排除原因", "") or "異常退車"
+                _set_cell_text(row.cells[7], f"異常退車：{reason}")
+            else:
+                _set_cell_text(row.cells[4], in_dt.strftime("%Y.%m.%d") if pd.notna(in_dt) else "")
+                _set_cell_text(row.cells[5], in_dt.strftime("%H:%M") if pd.notna(in_dt) else "")
+                _set_cell_text(row.cells[6], f"{r['數量']:g}")
+                _set_cell_text(row.cells[7], str(r.get("土資場名稱", "")))
         else:
             for c in range(len(row.cells)):
                 _set_cell_text(row.cells[c], "")
@@ -456,19 +490,38 @@ def generate_time_overview(day_df: pd.DataFrame, date, engineering_name: str) ->
 
 def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
                          monthly_cumulative_start: float = 0.0,
-                         cumulative_state: dict = None):
-    """回傳 (outputs, summary, updated_cumulative_state)。
+                         cumulative_state: dict = None,
+                         exclude_map: dict = None):
+    """回傳 (outputs, summary, updated_cumulative_state, excluded_log)。
 
     cumulative_state: {"YYYY-MM": 該月已累計的立方公尺數}，用來記住「上一次/上個月」的累計。
     若某個月份不在 cumulative_state 裡，就用 monthly_cumulative_start 當作該月的期初累計。
     處理完成後會回傳更新過的 cumulative_state，供下次上傳新資料時繼續沿用（自動接續累計，
     不需要每次都手動輸入期初累計）。
+
+    exclude_map: {完整聯單序號: 排除原因}，這些聯單會：
+      - 每日出場紀錄：正常顯示整列，但不計入當日/累計總量
+      - 運送時間一覽表：只留出場日期/時間，入場與數量留空，土資場名稱改填排除原因
+      - 統計月報表：不計入當日數量加總，並在備註欄註明原因與聯單號碼
+
+    excluded_log: list[dict]，每筆排除紀錄 {日期,聯單序號,車號,原因,數量}，供寫入 Google 試算表存查。
     """
     _check_templates_exist()
     df = prepare_dataframe(df)
+    df = apply_exclusions(df, exclude_map)
     outputs = {}
     summary = []
     cumulative_state = dict(cumulative_state or {})
+
+    excluded_log = []
+    for _, r in df[df["排除"]].iterrows():
+        excluded_log.append({
+            "日期": r["日期"].strftime("%Y-%m-%d") if pd.notna(r["日期"]) else "",
+            "聯單序號": shorten_ticket(r["聯單序號"]),
+            "車號": r.get("出場車號", ""),
+            "原因": r.get("排除原因", ""),
+            "數量": r.get("數量", 0.0),
+        })
 
     # --- 每日出場紀錄 + 運送時間一覽表：逐日產生 ---
     dates = summarize_dates(df)
@@ -508,7 +561,7 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
     for m in months:
         month_df = df[df["年月"] == m].reset_index(drop=True)
         eng_name = engineering_name_override or month_df["工程名稱"].iloc[0]
-        month_qty = month_df["數量"].sum()
+        month_qty = month_df[~month_df["排除"]]["數量"].sum()
         cum_end_of_month = running_cum_by_month.get(m, cumulative_state.get(str(m), monthly_cumulative_start))
         cum_before_month = cum_end_of_month - month_qty
 
@@ -518,7 +571,7 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
         fname_monthly = f"統計月報表_{m.strftime('%Y%m')}.docx"
         outputs[fname_monthly] = doc_monthly
 
-    return outputs, summary, cumulative_state
+    return outputs, summary, cumulative_state, excluded_log
 
 
 def doc_to_bytes(doc: Document) -> bytes:
