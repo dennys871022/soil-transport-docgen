@@ -339,7 +339,9 @@ def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
             _set_cell_text(row.cells[1], shorten_ticket(r["聯單序號"]))
             _set_cell_text(row.cells[2], str(r["出場車號"]))
             _set_cell_text(row.cells[3], f"{qty:g}")
-            checked = "✓" if str(r.get("狀態", "")).strip() == "已完成" else ""
+            # 4項檢查是出場當下的車輛/駕駛檢查，只要有出場紀錄就代表已通過檢查，
+            # 跟後續是否異常退車（清運數量認定）無關，一律打勾
+            checked = "✓"
             _set_cell_text(row.cells[4], checked)
             _set_cell_text(row.cells[5], checked)
             _set_cell_text(row.cells[6], checked)
