@@ -140,23 +140,38 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def shorten_ticket(ticket: str) -> str:
+    """把單一聯單序號的流水號部分縮短成4位數。
+    例如 'EYG10099EYG21699_B2-3_00000001' -> 'EYG10099EYG21699_B2-3_0001'
+    若最後一段不是純數字，就原樣返回不做縮短。
+    """
+    ticket = str(ticket)
+    if "_" not in ticket:
+        return ticket
+    prefix, suf = ticket.rsplit("_", 1)
+    if suf.isdigit():
+        return f"{prefix}_{int(suf):04d}"
+    return ticket
+
+
 def format_ticket_range(tickets):
-    """把一組聯單序號簡化成『共同前綴_起始 ~ 結束』的格式。
+    """把一組聯單序號簡化成『共同前綴_起始 ~ 結束』的格式，且流水號只保留4位數。
     例如 ['EYG10099EYG21699_B2-3_00000012', 'EYG10099EYG21699_B2-3_00000041']
-    會變成 'EYG10099EYG21699_B2-3_00000012 ~ 00000041'。
-    若只有一張，直接回傳該序號；若前綴不同（理論上同一天不會發生），退回顯示完整兩個序號。
+    會變成 'EYG10099EYG21699_B2-3_0012 ~ 0041'。
+    若只有一張，直接回傳縮短後的該序號；若前綴不同（理論上同一天不會發生），
+    退回顯示完整兩個序號（各自縮短）。
     """
     if not tickets:
         return ""
     if len(tickets) == 1:
-        return tickets[0]
+        return shorten_ticket(tickets[0])
     first, last = tickets[0], tickets[-1]
     if "_" in first and "_" in last:
         prefix1, suf1 = first.rsplit("_", 1)
         prefix2, suf2 = last.rsplit("_", 1)
-        if prefix1 == prefix2:
-            return f"{prefix1}_{suf1} ~ {suf2}"
-    return f"{first} ~ {last}"
+        if prefix1 == prefix2 and suf1.isdigit() and suf2.isdigit():
+            return f"{prefix1}_{int(suf1):04d} ~ {int(suf2):04d}"
+    return f"{shorten_ticket(first)} ~ {shorten_ticket(last)}"
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +323,7 @@ def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
             qty = r["數量"]
             daily_total += qty
             _set_cell_text(row.cells[0], str(i + 1))
-            _set_cell_text(row.cells[1], str(r["聯單序號"]))
+            _set_cell_text(row.cells[1], shorten_ticket(r["聯單序號"]))
             _set_cell_text(row.cells[2], str(r["出場車號"]))
             _set_cell_text(row.cells[3], f"{qty:g}")
             checked = "✓" if str(r.get("狀態", "")).strip() == "已完成" else ""
