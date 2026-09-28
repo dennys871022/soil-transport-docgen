@@ -30,6 +30,9 @@ CUMULATIVE_HEADER = ["年月", "累計立方公尺", "最後更新時間"]
 EXCLUDED_SHEET_NAME = "異常退車記錄"
 EXCLUDED_HEADER = ["日期", "聯單序號", "車號", "原因", "數量(m3)", "記錄時間"]
 
+PROCESSED_SHEET_NAME = "已處理聯單"
+PROCESSED_HEADER = ["聯單序號", "記錄時間"]
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -140,3 +143,22 @@ def log_excluded_tickets(spreadsheet, excluded_log: list):
     if rows_to_add:
         ws.append_rows(rows_to_add)
     return len(rows_to_add)
+
+
+def load_processed_tickets(spreadsheet) -> set:
+    """從「已處理聯單」分頁讀取所有先前已經處理過（已計入累計）的聯單序號，回傳 set。"""
+    ws = _get_or_create_worksheet(spreadsheet, PROCESSED_SHEET_NAME, PROCESSED_HEADER)
+    col = ws.col_values(1)[1:]  # 跳過標題列
+    return {v.strip() for v in col if v.strip()}
+
+
+def save_processed_tickets(spreadsheet, all_tickets: set, already_known: set = None):
+    """把這批新出現的聯單序號（尚未記錄過的）加進「已處理聯單」分頁，避免重複寫入。"""
+    already_known = already_known or set()
+    new_tickets = sorted(set(all_tickets) - already_known)
+    if not new_tickets:
+        return 0
+    ws = _get_or_create_worksheet(spreadsheet, PROCESSED_SHEET_NAME, PROCESSED_HEADER)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ws.append_rows([[t, now_str] for t in new_tickets])
+    return len(new_tickets)
