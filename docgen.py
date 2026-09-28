@@ -152,6 +152,34 @@ def apply_exclusions(df: pd.DataFrame, exclude_map: dict = None) -> pd.DataFrame
     return df
 
 
+def apply_duplicate_flags(df: pd.DataFrame, known_tickets: set = None) -> pd.DataFrame:
+    """依「先前已處理過的聯單序號」標記這批資料裡的重複項目。
+    加上一個欄位：重複 (bool)。重複的聯單不會被重複計入累計，但文件內容仍正常顯示
+    （因為那是真實發生過的紀錄，只是這次上傳的資料跟之前重疊了）。
+    """
+    df = df.copy()
+    known_tickets = known_tickets or set()
+    df["重複"] = df["聯單序號"].astype(str).isin(known_tickets)
+    return df
+
+
+def check_duplicates(df: pd.DataFrame, known_tickets: set = None) -> dict:
+    """上傳 CSV 後、產生文件前先呼叫，檢查有沒有跟之前已處理過的資料重疊。
+    回傳 {"tickets": [...重複的聯單序號(縮短顯示)...], "dates": [...重複的日期...],
+          "duplicate_qty": 重複部分原本會被重複計算的立方公尺數}
+    """
+    known_tickets = known_tickets or set()
+    df = df.copy()
+    df["_dup"] = df["聯單序號"].astype(str).isin(known_tickets)
+    dup_df = df[df["_dup"]]
+    if dup_df.empty:
+        return {"tickets": [], "dates": [], "duplicate_qty": 0.0}
+    dup_tickets = sorted(shorten_ticket(t) for t in dup_df["聯單序號"].astype(str).unique())
+    dup_dates = sorted(str(d) for d in dup_df["日期"].dropna().unique()) if "日期" in dup_df.columns else []
+    dup_qty = dup_df["數量"].sum() if "數量" in dup_df.columns else 0.0
+    return {"tickets": dup_tickets, "dates": dup_dates, "duplicate_qty": float(dup_qty)}
+
+
 def shorten_ticket(ticket: str) -> str:
     """把單一聯單序號的流水號部分縮短成4位數。
     例如 'EYG10099EYG21699_B2-3_00000001' -> 'EYG10099EYG21699_B2-3_0001'
@@ -191,10 +219,13 @@ def format_ticket_range(tickets):
 # ---------------------------------------------------------------------------
 
 def load_cumulative_state(file_obj) -> dict:
-    """讀取先前下載的累計記錄 JSON 檔，回傳 {"YYYY-MM": 累計立方公尺} 的 dict。"""
+    """讀取先前下載的累計記錄 JSON 檔。
+    回傳 {"cumulative": {"YYYY-MM": 累計立方公尺,...}, "processed_tickets": [...已處理過的聯單序號...]}。
+    相容舊版格式（舊版檔案內容是單純的 {"YYYY-MM": 數字} 沒有 processed_tickets）。
+    """
     import json
     if file_obj is None:
-        return {}
+        return {"cumulative": {}, "processed_tickets": []}
     try:
         if hasattr(file_obj, "seek"):
             file_obj.seek(0)
@@ -202,14 +233,25 @@ def load_cumulative_state(file_obj) -> dict:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8-sig")
         data = json.loads(raw)
-        return {str(k): float(v) for k, v in data.items()}
+        if "cumulative" in data or "processed_tickets" in data:
+            cumulative = {str(k): float(v) for k, v in (data.get("cumulative") or {}).items()}
+            processed = list(data.get("processed_tickets") or [])
+        else:
+            # 舊版格式：整份檔案就是 {"YYYY-MM": 數字}
+            cumulative = {str(k): float(v) for k, v in data.items()}
+            processed = []
+        return {"cumulative": cumulative, "processed_tickets": processed}
     except Exception as e:  # noqa: BLE001
         raise ValueError(f"累計記錄檔格式錯誤，請確認是上次程式產生的 JSON 檔：{e}")
 
 
-def dump_cumulative_state(state: dict) -> str:
+def dump_cumulative_state(cumulative: dict, processed_tickets=None) -> str:
     import json
-    return json.dumps(state, ensure_ascii=False, indent=2)
+    payload = {
+        "cumulative": cumulative,
+        "processed_tickets": sorted(set(processed_tickets or [])),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def summarize_dates(df: pd.DataFrame):
@@ -328,6 +370,7 @@ def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
         data_row_count += 1
 
     daily_total = 0.0
+    cumulative_delta = 0.0
     for i in range(data_row_count):
         row = table.rows[header_rows + i]
         if i < n:
@@ -335,6 +378,8 @@ def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
             qty = r["數量"]
             if not r.get("排除", False):
                 daily_total += qty
+                if not r.get("重複", False):
+                    cumulative_delta += qty
             _set_cell_text(row.cells[0], str(i + 1))
             _set_cell_text(row.cells[1], shorten_ticket(r["聯單序號"]))
             _set_cell_text(row.cells[2], str(r["出場車號"]))
@@ -355,7 +400,7 @@ def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
             for c in range(1, 10):
                 _set_cell_text(row.cells[c], "")
 
-    cumulative_after = cumulative_before + daily_total
+    cumulative_after = cumulative_before + cumulative_delta
     total_row = table.rows[total_row_index]
     total_text = (
         f"有價土石方運送數量    ：{daily_total:g}   立方公尺\n"
@@ -392,6 +437,7 @@ def generate_monthly_report(month_df: pd.DataFrame, year_month, engineering_name
     grouped = {d: g for d, g in month_df.groupby(month_df["日期"])}
 
     month_total = 0.0
+    month_cumulative_delta = 0.0
     for day in range(1, days_in_month + 1):
         row = table.rows[day]  # row 1 對應 1 日 ... row 31 對應 31 日
         the_date = pd.Timestamp(year=year_month.year, month=year_month.month, day=day).date()
@@ -404,6 +450,7 @@ def generate_monthly_report(month_df: pd.DataFrame, year_month, engineering_name
             excluded = g[g["排除"]]
             qty_sum = included["數量"].sum()
             month_total += qty_sum
+            month_cumulative_delta += included[~included["重複"]]["數量"].sum()
             _set_cell_text(row.cells[1], ticket_range)
             _set_cell_text(row.cells[2], str(count))
             _set_cell_text(row.cells[3], f"{qty_sum:g}")
@@ -419,7 +466,7 @@ def generate_monthly_report(month_df: pd.DataFrame, year_month, engineering_name
                 _set_cell_text(row.cells[4], "")
         # 若當天沒有資料，保留原樣（空白）
 
-    cumulative_after = cumulative_before + month_total
+    cumulative_after = cumulative_before + month_cumulative_delta
     total_row = table.rows[len(table.rows) - 1]  # 範本固定 33 列(含 1~31 日)，總計永遠在最後一列
     total_text = (
         f"有價土石方運送數量    ：{month_total:g}   立方公尺\n"
@@ -493,24 +540,34 @@ def generate_time_overview(day_df: pd.DataFrame, date, engineering_name: str) ->
 def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
                          monthly_cumulative_start: float = 0.0,
                          cumulative_state: dict = None,
-                         exclude_map: dict = None):
-    """回傳 (outputs, summary, updated_cumulative_state, excluded_log)。
+                         exclude_map: dict = None,
+                         known_tickets: set = None):
+    """回傳 (outputs, summary, updated_cumulative_state, excluded_log, updated_known_tickets, duplicate_info)。
 
     cumulative_state: {"YYYY-MM": 該月已累計的立方公尺數}，用來記住「上一次/上個月」的累計。
     若某個月份不在 cumulative_state 裡，就用 monthly_cumulative_start 當作該月的期初累計。
-    處理完成後會回傳更新過的 cumulative_state，供下次上傳新資料時繼續沿用（自動接續累計，
-    不需要每次都手動輸入期初累計）。
 
     exclude_map: {完整聯單序號: 排除原因}，這些聯單會：
       - 每日出場紀錄：正常顯示整列，但不計入當日/累計總量
       - 運送時間一覽表：只留出場日期/時間，入場與數量留空，土資場名稱改填排除原因
       - 統計月報表：不計入當日數量加總，並在備註欄註明原因與聯單號碼
 
-    excluded_log: list[dict]，每筆排除紀錄 {日期,聯單序號,車號,原因,數量}，供寫入 Google 試算表存查。
+    known_tickets: 先前已經處理過、已計入累計的聯單序號集合（防止重複計算）。
+      這批資料裡如果有聯單序號出現在 known_tickets 裡，文件內容依然正常顯示
+      （因為是真實發生過的紀錄），但不會被重複加進累計數字。
+
+    excluded_log: list[dict]，這次的異常排除紀錄，供寫入 Google 試算表存查。
+    updated_known_tickets: 這批處理完之後，合併進所有聯單序號的新集合，之後要記得存起來。
+    duplicate_info: {"tickets":[...], "dates":[...], "duplicate_qty": 數字}，這批資料裡有多少
+      是先前已經處理過的重複資料（供介面顯示提醒用）。
     """
     _check_templates_exist()
     df = prepare_dataframe(df)
+    known_tickets = set(known_tickets or set())
+    duplicate_info = check_duplicates(df, known_tickets)
+
     df = apply_exclusions(df, exclude_map)
+    df = apply_duplicate_flags(df, known_tickets)
     outputs = {}
     summary = []
     cumulative_state = dict(cumulative_state or {})
@@ -563,9 +620,9 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
     for m in months:
         month_df = df[df["年月"] == m].reset_index(drop=True)
         eng_name = engineering_name_override or month_df["工程名稱"].iloc[0]
-        month_qty = month_df[~month_df["排除"]]["數量"].sum()
+        month_cumulative_delta = month_df[(~month_df["排除"]) & (~month_df["重複"])]["數量"].sum()
         cum_end_of_month = running_cum_by_month.get(m, cumulative_state.get(str(m), monthly_cumulative_start))
-        cum_before_month = cum_end_of_month - month_qty
+        cum_before_month = cum_end_of_month - month_cumulative_delta
 
         doc_monthly, month_total, cum_after = generate_monthly_report(
             month_df, m, eng_name, cum_before_month
@@ -573,7 +630,9 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
         fname_monthly = f"統計月報表_{m.strftime('%Y%m')}.docx"
         outputs[fname_monthly] = doc_monthly
 
-    return outputs, summary, cumulative_state, excluded_log
+    updated_known_tickets = known_tickets | set(df["聯單序號"].astype(str).tolist())
+
+    return outputs, summary, cumulative_state, excluded_log, updated_known_tickets, duplicate_info
 
 
 def doc_to_bytes(doc: Document) -> bytes:
