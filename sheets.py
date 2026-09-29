@@ -25,10 +25,11 @@ Google 試算表串接：把每月累計數字、異常排除紀錄寫進使用�
 from datetime import datetime
 
 CUMULATIVE_SHEET_NAME = "累計總表"
-CUMULATIVE_HEADER = ["年月", "累計立方公尺", "最後更新時間"]
-# 注意：「累計立方公尺」欄位是「累計到該月月底為止的總量」（跨月持續往上加，不會每月歸零），
-# 不是那個月自己單月的運送量。若懷疑舊資料存錯（例如看起來像是每月各自獨立的量），
-# 使用 docgen.fix_legacy_cumulative() 做一次性修正。
+CUMULATIVE_HEADER = ["年月", "本月數量", "累計立方公尺", "最後更新時間"]
+# 「本月數量」是那個月自己單獨運送的量（不會累加）；
+# 「累計立方公尺」是累計到該月月底為止的總量（跨月持續往上加，不會每月歸零）。
+# 兩者的關係：累計立方公尺 = 目前為止所有「本月數量」的加總，可以互相核對是否正確。
+# 若懷疑資料存錯，使用 docgen.fix_legacy_cumulative() 做一次性修正。
 
 EXCLUDED_SHEET_NAME = "異常退車記錄"
 EXCLUDED_HEADER = ["日期", "聯單序號", "車號", "原因", "數量(m3)", "記錄時間"]
@@ -80,7 +81,9 @@ def _get_or_create_worksheet(spreadsheet, title, header):
 
 
 def load_cumulative_from_sheet(spreadsheet) -> dict:
-    """從「累計總表」分頁讀取目前每個月的累計立方公尺，回傳 {"YYYY-MM": 數字}。"""
+    """從「累計總表」分頁讀取目前每個月的累計立方公尺，回傳 {"YYYY-MM": 累計數字}。
+    （「本月數量」欄位只是方便人工核對用，讀取時不需要用到它，累計數字才是唯一權威來源。）
+    """
     ws = _get_or_create_worksheet(spreadsheet, CUMULATIVE_SHEET_NAME, CUMULATIVE_HEADER)
     records = ws.get_all_records()
     result = {}
@@ -96,7 +99,12 @@ def load_cumulative_from_sheet(spreadsheet) -> dict:
 
 
 def save_cumulative_to_sheet(spreadsheet, state: dict):
-    """把更新過的累計狀態寫回「累計總表」分頁（該月份已存在就更新，不存在就新增一列）。"""
+    """把更新過的累計狀態寫回「累計總表」分頁（該月份已存在就更新，不存在就新增一列）。
+    會自動從累計數字反推「本月數量」一併寫入，方便人工核對
+    （累計立方公尺應該要等於所有本月數量的加總）。
+    """
+    from docgen import compute_monthly_own_amounts
+
     ws = _get_or_create_worksheet(spreadsheet, CUMULATIVE_SHEET_NAME, CUMULATIVE_HEADER)
     records = ws.get_all_records()
     existing_row_of = {}
@@ -105,15 +113,17 @@ def save_cumulative_to_sheet(spreadsheet, state: dict):
         if ym:
             existing_row_of[ym] = idx + 2  # +2: 第1列是標題，get_all_records 從第2列開始且是0-index
 
+    own_amounts = compute_monthly_own_amounts(state)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     updates = []
     appends = []
     for ym, total in state.items():
+        own = own_amounts.get(ym, 0.0)
         if ym in existing_row_of:
             row_no = existing_row_of[ym]
-            updates.append({"range": f"B{row_no}:C{row_no}", "values": [[total, now_str]]})
+            updates.append({"range": f"B{row_no}:D{row_no}", "values": [[own, total, now_str]]})
         else:
-            appends.append([ym, total, now_str])
+            appends.append([ym, own, total, now_str])
 
     if updates:
         ws.batch_update(updates)
