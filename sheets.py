@@ -70,14 +70,67 @@ def get_spreadsheet(st):
     return client.open_by_key(sheet_id)
 
 
+_OLD_CUMULATIVE_HEADER = ["年月", "累計立方公尺", "最後更新時間"]
+
+
+def _migrate_cumulative_sheet(ws):
+    """把舊版3欄格式（年月/累計立方公尺/最後更新時間）安全遷移成新版4欄格式
+    （年月/本月數量/累計立方公尺/最後更新時間）。
+
+    做法：把整張表的資料讀進 Python、算好新的欄位排列後，清空整張表重新寫入一次，
+    避免用簡單的「覆蓋表頭文字」造成資料錯位（欄位名稱換了，但底下的數字沒有跟著搬）。
+    """
+    from docgen import compute_monthly_own_amounts
+
+    all_values = ws.get_all_values()
+    if not all_values:
+        ws.update(values=[CUMULATIVE_HEADER], range_name="A1")
+        return
+
+    data_rows = all_values[1:]
+    cumulative = {}
+    for row in data_rows:
+        if len(row) >= 2 and str(row[0]).strip():
+            try:
+                cumulative[str(row[0]).strip()] = float(row[1])
+            except (ValueError, IndexError):
+                pass
+    own_amounts = compute_monthly_own_amounts(cumulative)
+
+    new_rows = [CUMULATIVE_HEADER]
+    for row in data_rows:
+        ym = str(row[0]).strip() if row else ""
+        if not ym:
+            continue
+        old_cum = row[1] if len(row) > 1 else ""
+        old_ts = row[2] if len(row) > 2 else ""
+        new_rows.append([ym, own_amounts.get(ym, ""), old_cum, old_ts])
+
+    ws.clear()
+    ws.update(values=new_rows, range_name="A1")
+
+
 def _get_or_create_worksheet(spreadsheet, title, header):
     import gspread
     try:
         ws = spreadsheet.worksheet(title)
+        current_header = ws.row_values(1)
+        if title == CUMULATIVE_SHEET_NAME and current_header[:3] == _OLD_CUMULATIVE_HEADER and header == CUMULATIVE_HEADER:
+            _migrate_cumulative_sheet(ws)
+        elif current_header[:len(header)] != header:
+            # 一般情況（欄位數沒變、只是文字不同，或本來就是全新分頁）：直接寫入正確表頭即可
+            ws.update(values=[header], range_name="A1")
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=title, rows=200, cols=max(6, len(header)))
         ws.append_row(header)
     return ws
+
+
+def _get_all_records_safe(ws, header):
+    """呼叫 get_all_records() 時明確指定欄位名稱（expected_headers），
+    避免舊分頁殘留的空白/重複表頭欄位讓 gspread 直接噴錯
+    （這是官方錯誤訊息建議的處理方式）。"""
+    return ws.get_all_records(expected_headers=header)
 
 
 def load_cumulative_from_sheet(spreadsheet) -> dict:
@@ -85,7 +138,7 @@ def load_cumulative_from_sheet(spreadsheet) -> dict:
     （「本月數量」欄位只是方便人工核對用，讀取時不需要用到它，累計數字才是唯一權威來源。）
     """
     ws = _get_or_create_worksheet(spreadsheet, CUMULATIVE_SHEET_NAME, CUMULATIVE_HEADER)
-    records = ws.get_all_records()
+    records = _get_all_records_safe(ws, CUMULATIVE_HEADER)
     result = {}
     for r in records:
         ym = str(r.get("年月", "")).strip()
@@ -106,7 +159,7 @@ def save_cumulative_to_sheet(spreadsheet, state: dict):
     from docgen import compute_monthly_own_amounts
 
     ws = _get_or_create_worksheet(spreadsheet, CUMULATIVE_SHEET_NAME, CUMULATIVE_HEADER)
-    records = ws.get_all_records()
+    records = _get_all_records_safe(ws, CUMULATIVE_HEADER)
     existing_row_of = {}
     for idx, r in enumerate(records):
         ym = str(r.get("年月", "")).strip()
@@ -136,7 +189,7 @@ def log_excluded_tickets(spreadsheet, excluded_log: list):
     if not excluded_log:
         return 0
     ws = _get_or_create_worksheet(spreadsheet, EXCLUDED_SHEET_NAME, EXCLUDED_HEADER)
-    existing_records = ws.get_all_records()
+    existing_records = _get_all_records_safe(ws, EXCLUDED_HEADER)
     already_logged = {str(r.get("聯單序號", "")).strip() for r in existing_records}
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
