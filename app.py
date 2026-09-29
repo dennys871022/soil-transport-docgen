@@ -17,6 +17,7 @@ from docgen import (
     check_duplicates,
     doc_to_bytes,
     dump_cumulative_state,
+    fix_legacy_cumulative,
     load_cumulative_state,
     prepare_dataframe,
     read_csv_any_encoding,
@@ -91,6 +92,33 @@ with st.sidebar:
         "若某個月份沒有累計記錄可以沿用，這個月要從多少開始累計？（新工程第一次使用時填這裡）",
         min_value=0.0, value=0.0, step=1.0,
     )
+
+    if cumulative_state:
+        with st.expander("🔧 累計數字好像不對？點此一次性修正"):
+            st.caption(
+                "如果你發現「累計」欄位看起來像是每個月各自獨立的量（例如6月1464、7月7200、8月1596，"
+                "而不是持續往上加），可以用這個工具修正成正確的跨月累計。"
+                "**這個修正只能執行一次**，資料正確之後請不要重複套用，否則會疊加錯誤。"
+            )
+            st.write("目前的累計資料：")
+            st.json(cumulative_state, expanded=False)
+            fixed_preview = fix_legacy_cumulative(cumulative_state)
+            st.write("修正後預覽（假設目前數字是各月各自的量，依時間先後累加）：")
+            st.json(fixed_preview, expanded=False)
+            if st.button("✅ 確認套用這個修正"):
+                cumulative_state = fixed_preview
+                if sheets_enabled:
+                    try:
+                        sheets.save_cumulative_to_sheet(spreadsheet, cumulative_state)
+                        st.success("已修正並寫回 Google 試算表，重新整理頁面即可看到正確數字。")
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"寫回試算表失敗：{e}")
+                else:
+                    st.success("已在本次畫面套用修正。請記得等一下產生文件後，下載新的記錄檔保存這個修正結果。")
+                st.session_state["_cumulative_state_override"] = cumulative_state
+
+    if "_cumulative_state_override" in st.session_state:
+        cumulative_state = st.session_state["_cumulative_state_override"]
 
     st.markdown("---")
     st.markdown(
