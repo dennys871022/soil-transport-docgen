@@ -24,6 +24,7 @@ from docgen import (
     shorten_ticket,
     summarize_dates,
     summarize_months,
+    validate_cumulative_monotonic,
     _check_templates_exist,
 )
 
@@ -257,7 +258,14 @@ if st.button("🚀 產生 Word 文件", type="primary"):
     st.subheader("📌 累計記錄")
     st.json(updated_state, expanded=False)
 
-    if sheets_enabled:
+    problems = validate_cumulative_monotonic(updated_state)
+    if problems:
+        st.error(
+            "⚠️ 偵測到累計數字異常（不應該發生，請截圖回報）：\n\n" + "\n".join(f"- {p}" for p in problems) +
+            "\n\n為了安全起見，這次**不會**自動寫回 Google 試算表或視為可信的累計記錄，"
+            "請先確認資料正確性。文件仍然可以下載。"
+        )
+    elif sheets_enabled:
         try:
             sheets.save_cumulative_to_sheet(spreadsheet, updated_state)
             logged_count = sheets.log_excluded_tickets(spreadsheet, excluded_log)
