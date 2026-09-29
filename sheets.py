@@ -26,6 +26,9 @@ from datetime import datetime
 
 CUMULATIVE_SHEET_NAME = "累計總表"
 CUMULATIVE_HEADER = ["年月", "累計立方公尺", "最後更新時間"]
+# 注意：「累計立方公尺」欄位是「累計到該月月底為止的總量」（跨月持續往上加，不會每月歸零），
+# 不是那個月自己單月的運送量。若懷疑舊資料存錯（例如看起來像是每月各自獨立的量），
+# 使用 docgen.fix_legacy_cumulative() 做一次性修正。
 
 EXCLUDED_SHEET_NAME = "異常退車記錄"
 EXCLUDED_HEADER = ["日期", "聯單序號", "車號", "原因", "數量(m3)", "記錄時間"]
