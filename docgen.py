@@ -537,6 +537,28 @@ def generate_time_overview(day_df: pd.DataFrame, date, engineering_name: str) ->
 # 高階流程：一次處理整份 CSV，回傳 {檔名: Document}
 # ---------------------------------------------------------------------------
 
+def fix_legacy_cumulative(state: dict) -> dict:
+    """一次性修正工具：把舊版「每月各自累計歸零」的錯誤資料，轉換成正確的「跨月持續累加」格式。
+
+    舊版錯誤：state 裡每個月的數字其實是「那個月自己的運送量」（例如 6月1464、7月7200、8月1596）。
+    正確格式：state 裡每個月的數字應該是「累計到那個月月底為止的總量」
+             （6月1464、7月1464+7200=8664、8月8664+1596=10260）。
+
+    做法：把所有月份依時間先後排序，逐月往上累加，產生新的正確版本。
+    只應該手動觸發執行「一次」，修正完之後往後的資料就會是正確格式，不能重複套用
+    （重複套用會把已經正確的累計值再錯誤地疊加一次）。
+    """
+    if not state:
+        return {}
+    ordered_keys = sorted(state.keys())
+    fixed = {}
+    running = 0.0
+    for k in ordered_keys:
+        running += float(state[k])
+        fixed[k] = running
+    return fixed
+
+
 def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
                          monthly_cumulative_start: float = 0.0,
                          cumulative_state: dict = None,
@@ -544,8 +566,11 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
                          known_tickets: set = None):
     """回傳 (outputs, summary, updated_cumulative_state, excluded_log, updated_known_tickets, duplicate_info)。
 
-    cumulative_state: {"YYYY-MM": 該月已累計的立方公尺數}，用來記住「上一次/上個月」的累計。
-    若某個月份不在 cumulative_state 裡，就用 monthly_cumulative_start 當作該月的期初累計。
+    cumulative_state: {"YYYY-MM": 累計到該月月底為止的立方公尺總量}。
+      這是「整個工程從開始到現在」的累計，跨月會持續往上加、不會每月重新歸零
+      （例如6月底累計1464，7月運了7200，7月底累計就是1464+7200=8664，不是7200）。
+      取用時一律用目前所有月份中「最大值」當作最新的累計基準，之後往下疊加這批資料的新量。
+      若完全沒有記錄，就用 monthly_cumulative_start 當作起點。
 
     exclude_map: {完整聯單序號: 排除原因}，這些聯單會：
       - 每日出場紀錄：正常顯示整列，但不計入當日/累計總量
@@ -582,24 +607,24 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
             "數量": r.get("數量", 0.0),
         })
 
-    # --- 每日出場紀錄 + 運送時間一覽表：逐日產生 ---
+    # 整個工程「目前為止」的累計基準：所有已知月份中的最大值（因為是持續往上加的總量，
+    # 最大值必然是最新的進度；若完全沒有記錄，就用使用者填的期初累計）
+    running_total = max(cumulative_state.values()) if cumulative_state else monthly_cumulative_start
+
+    # --- 每日出場紀錄 + 運送時間一覽表：逐日產生（日期已由 summarize_dates 由小到大排序）---
     dates = summarize_dates(df)
-    running_cum_by_month = {}
+    cumulative_after_month = {}  # 記錄這批資料處理完，每個月「最後」的累計值，供月報表使用
 
     for d in dates:
         day_df = df[df["日期"] == d].reset_index(drop=True)
         eng_name = engineering_name_override or day_df["工程名稱"].iloc[0]
         period = pd.Period(year=d.year, month=d.month, freq="M")
-        period_key = str(period)
-        if period not in running_cum_by_month:
-            running_cum_by_month[period] = cumulative_state.get(period_key, monthly_cumulative_start)
-        cum_before = running_cum_by_month[period]
 
         doc_daily, daily_total, cum_after = generate_daily_record(
-            day_df, d, eng_name, cum_before
+            day_df, d, eng_name, running_total
         )
-        running_cum_by_month[period] = cum_after
-        cumulative_state[period_key] = cum_after
+        running_total = cum_after
+        cumulative_after_month[period] = running_total
 
         fname_daily = f"每日出場紀錄_{d.strftime('%Y%m%d')}.docx"
         outputs[fname_daily] = doc_daily
@@ -612,8 +637,9 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
             "日期": d.strftime("%Y-%m-%d"),
             "筆數": len(day_df),
             "當日數量(m3)": daily_total,
-            "當月累計(m3)": cum_after,
+            "累計(m3)": cum_after,
         })
+        cumulative_state[str(period)] = running_total
 
     # --- 統計月報表：逐月產生 ---
     months = summarize_months(df)
@@ -621,7 +647,7 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
         month_df = df[df["年月"] == m].reset_index(drop=True)
         eng_name = engineering_name_override or month_df["工程名稱"].iloc[0]
         month_cumulative_delta = month_df[(~month_df["排除"]) & (~month_df["重複"])]["數量"].sum()
-        cum_end_of_month = running_cum_by_month.get(m, cumulative_state.get(str(m), monthly_cumulative_start))
+        cum_end_of_month = cumulative_after_month.get(m, running_total)
         cum_before_month = cum_end_of_month - month_cumulative_delta
 
         doc_monthly, month_total, cum_after = generate_monthly_report(
