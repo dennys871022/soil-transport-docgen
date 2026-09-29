@@ -559,6 +559,38 @@ def fix_legacy_cumulative(state: dict) -> dict:
     return fixed
 
 
+def validate_cumulative_monotonic(state: dict) -> list:
+    """檢查累計序列是否為正確的「跨月遞增」。回傳問題清單（空清單代表沒問題）。
+    存檔前應該先呼叫這個檢查，避免資料毀損的情況被默默存進去。
+    """
+    problems = []
+    if not state:
+        return problems
+    ordered = sorted(state.keys(), key=lambda k: pd.Period(k, freq="M"))
+    prev_key, prev_val = None, None
+    for k in ordered:
+        v = state[k]
+        if prev_val is not None and v < prev_val:
+            problems.append(f"{k}（{v:g}）比前一個月 {prev_key}（{prev_val:g}）還小，累計不應該變小")
+        prev_key, prev_val = k, v
+    return problems
+
+
+def compute_monthly_own_amounts(cumulative_state: dict) -> dict:
+    """從累計序列反推「每個月自己的量」（相鄰兩個月累計值的差），方便人工核對。
+    第一個有紀錄的月份，本月數量就等於它自己的累計值（假設期初累計為0時）。
+    """
+    if not cumulative_state:
+        return {}
+    ordered = sorted(cumulative_state.keys(), key=lambda k: pd.Period(k, freq="M"))
+    result = {}
+    prev = 0.0
+    for k in ordered:
+        result[k] = cumulative_state[k] - prev
+        prev = cumulative_state[k]
+    return result
+
+
 def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
                          monthly_cumulative_start: float = 0.0,
                          cumulative_state: dict = None,
@@ -607,24 +639,64 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
             "數量": r.get("數量", 0.0),
         })
 
-    # 整個工程「目前為止」的累計基準：所有已知月份中的最大值（因為是持續往上加的總量，
-    # 最大值必然是最新的進度；若完全沒有記錄，就用使用者填的期初累計）
-    running_total = max(cumulative_state.values()) if cumulative_state else monthly_cumulative_start
+    original_cumulative_state = dict(cumulative_state)  # 保留原始值，供計算「歷史值+新增量」用
 
-    # --- 每日出場紀錄 + 運送時間一覽表：逐日產生（日期已由 summarize_dates 由小到大排序）---
+    # ------------------------------------------------------------------
+    # 先算出「這批資料處理完之後，每個月正確的累計值」。
+    # 規則很單純：
+    #   - 這個月「已經有歷史累計值」-> 正確答案永遠是「歷史值 + 這批新增的量」，
+    #     不管這批資料裡這個月的新增量是 0（純重複/退車）還是有新資料，
+    #     都不會受到其他月份牽連（這是先前造成 6/7/8 月全變成同一個數字的錯誤根源：
+    #     之前是用「前一個月的結算值」當基準，而不是這個月「自己原本的」歷史值）。
+    #   - 這個月「完全沒有歷史累計值」（第一次出現）-> 用前一個月（依時間排序）的正確
+    #     累計值當基準，往上加這批新增的量；如果連前一個月都沒有記錄，就用期初累計。
+    # ------------------------------------------------------------------
     dates = summarize_dates(df)
-    cumulative_after_month = {}  # 記錄這批資料處理完，每個月「最後」的累計值，供月報表使用
+    periods_in_order = []
+    seen_periods = set()
+    for d in dates:
+        p = pd.Period(year=d.year, month=d.month, freq="M")
+        if p not in seen_periods:
+            periods_in_order.append(p)
+            seen_periods.add(p)
+
+    period_end_cumulative = {}   # 這批處理完，該月正確的「累計到月底」總量
+    period_start_cumulative = {}  # 這批資料裡，該月第一筆日期要用的累計起點（給每日出場紀錄逐日疊加用）
+    carry = None
+    for p in periods_in_order:
+        month_df_p = df[df["年月"] == p]
+        delta_p = month_df_p[(~month_df_p["排除"]) & (~month_df_p["重複"])]["數量"].sum()
+
+        if str(p) in original_cumulative_state:
+            # 這個月本來就有正確的歷史累計值：新答案 = 歷史值 + 這批新增的量，
+            # 完全不理會其他月份目前算到哪裡，避免互相污染
+            end_value = original_cumulative_state[str(p)] + delta_p
+            start_value = original_cumulative_state[str(p)]  # 這批新增量還沒加進去之前的起點
+        else:
+            baseline = carry if carry is not None else (
+                max([v for k, v in original_cumulative_state.items() if pd.Period(k, freq="M") < p], default=monthly_cumulative_start)
+            )
+            end_value = baseline + delta_p
+            start_value = baseline
+
+        period_end_cumulative[p] = end_value
+        period_start_cumulative[p] = start_value
+        carry = end_value
+
+    # ------------------------------------------------------------------
+    # 實際產生文件：每個月從 period_start_cumulative 開始，逐日往上疊加
+    # （重複/排除的資料當天 delta 是 0，自然就會維持原本正確的數字不變）。
+    # ------------------------------------------------------------------
+    running_by_period = {}
 
     for d in dates:
         day_df = df[df["日期"] == d].reset_index(drop=True)
         eng_name = engineering_name_override or day_df["工程名稱"].iloc[0]
         period = pd.Period(year=d.year, month=d.month, freq="M")
 
-        doc_daily, daily_total, cum_after = generate_daily_record(
-            day_df, d, eng_name, running_total
-        )
-        running_total = cum_after
-        cumulative_after_month[period] = running_total
+        cum_before = running_by_period.get(period, period_start_cumulative[period])
+        doc_daily, daily_total, cum_after = generate_daily_record(day_df, d, eng_name, cum_before)
+        running_by_period[period] = cum_after
 
         fname_daily = f"每日出場紀錄_{d.strftime('%Y%m%d')}.docx"
         outputs[fname_daily] = doc_daily
@@ -639,16 +711,16 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
             "當日數量(m3)": daily_total,
             "累計(m3)": cum_after,
         })
-        cumulative_state[str(period)] = running_total
+
+    for p in periods_in_order:
+        cumulative_state[str(p)] = period_end_cumulative[p]
 
     # --- 統計月報表：逐月產生 ---
     months = summarize_months(df)
     for m in months:
         month_df = df[df["年月"] == m].reset_index(drop=True)
         eng_name = engineering_name_override or month_df["工程名稱"].iloc[0]
-        month_cumulative_delta = month_df[(~month_df["排除"]) & (~month_df["重複"])]["數量"].sum()
-        cum_end_of_month = cumulative_after_month.get(m, running_total)
-        cum_before_month = cum_end_of_month - month_cumulative_delta
+        cum_before_month = period_start_cumulative.get(m, monthly_cumulative_start)
 
         doc_monthly, month_total, cum_after = generate_monthly_report(
             month_df, m, eng_name, cum_before_month
