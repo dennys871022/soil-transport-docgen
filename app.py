@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 import sheets
+from docx import Document as DocxDocument
 from docgen import (
     CONTRACTOR_NAME,
     build_all_documents,
@@ -19,6 +20,7 @@ from docgen import (
     dump_cumulative_state,
     fix_legacy_cumulative,
     load_cumulative_state,
+    merge_docs_with_page_breaks,
     prepare_dataframe,
     read_csv_any_encoding,
     shorten_ticket,
@@ -320,6 +322,37 @@ if st.button("🚀 產生 Word 文件", type="primary"):
         mime="application/zip",
         type="primary",
     )
+
+    # 合併成單一檔案（每日出場紀錄、運送時間一覽表各自合併，換日期強制分頁）
+    daily_keys = sorted(k for k in outputs if k.startswith("每日出場紀錄"))
+    time_keys = sorted(k for k in outputs if k.startswith("運送時間一覽表"))
+
+    if len(daily_keys) > 1 or len(time_keys) > 1:
+        st.subheader("📎 合併成單一檔案")
+        st.caption("把所有日期的文件合併成一份 Word 檔，換日期會強制從新的一頁開始。")
+        col_m1, col_m2 = st.columns(2)
+        if len(daily_keys) > 1:
+            daily_docs = [DocxDocument(io.BytesIO(doc_to_bytes(outputs[k]))) for k in daily_keys]
+            merged_daily = merge_docs_with_page_breaks(daily_docs)
+            merged_daily_bytes = io.BytesIO()
+            merged_daily.save(merged_daily_bytes)
+            col_m1.download_button(
+                f"⬇️ 合併每日出場紀錄（共{len(daily_keys)}天）",
+                data=merged_daily_bytes.getvalue(),
+                file_name=f"每日出場紀錄_合併_{daily_keys[0].split('_')[-1].replace('.docx','')}-{daily_keys[-1].split('_')[-1].replace('.docx','')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        if len(time_keys) > 1:
+            time_docs = [DocxDocument(io.BytesIO(doc_to_bytes(outputs[k]))) for k in time_keys]
+            merged_time = merge_docs_with_page_breaks(time_docs)
+            merged_time_bytes = io.BytesIO()
+            merged_time.save(merged_time_bytes)
+            col_m2.download_button(
+                f"⬇️ 合併運送時間一覽表（共{len(time_keys)}天）",
+                data=merged_time_bytes.getvalue(),
+                file_name=f"運送時間一覽表_合併_{time_keys[0].split('_')[-1].replace('.docx','')}-{time_keys[-1].split('_')[-1].replace('.docx','')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
 
     st.subheader("或單獨下載每份 Word 檔案")
     for fname, doc in outputs.items():
