@@ -60,15 +60,20 @@ with st.sidebar:
 
     cumulative_state = {}
     known_tickets = set()
+    soil_cumulative_state = {}
 
     if sheets_enabled:
         st.success("✅ 已連接 Google 試算表，累計數字與已處理聯單會自動讀取與寫回")
         try:
             cumulative_state = sheets.load_cumulative_from_sheet(spreadsheet)
             known_tickets = sheets.load_processed_tickets(spreadsheet)
-            st.caption(f"目前已記錄 {len(known_tickets)} 張聯單、{len(cumulative_state)} 個月份的累計")
+            soil_cumulative_state = sheets.load_soil_cumulative_from_sheet(spreadsheet)
+            st.caption(f"目前已記錄 {len(known_tickets)} 張聯單、{len(cumulative_state)} 個月份的累計、{len(soil_cumulative_state)} 種土質代碼")
             if cumulative_state:
                 st.json(cumulative_state, expanded=False)
+            if soil_cumulative_state:
+                st.caption("各土質代碼累計：")
+                st.json(soil_cumulative_state, expanded=False)
         except Exception as e:  # noqa: BLE001
             st.error(f"讀取 Google 試算表資料失敗：{e}")
     else:
@@ -82,9 +87,15 @@ with st.sidebar:
                 loaded = load_cumulative_state(state_file)
                 cumulative_state = loaded["cumulative"]
                 known_tickets = set(loaded["processed_tickets"])
-                st.success(f"已讀取記錄：{len(cumulative_state)} 個月份的累計、{len(known_tickets)} 張已處理聯單")
+                soil_cumulative_state = loaded["soil_cumulative"]
+                st.success(
+                    f"已讀取記錄：{len(cumulative_state)} 個月份的累計、"
+                    f"{len(known_tickets)} 張已處理聯單、{len(soil_cumulative_state)} 種土質代碼"
+                )
                 if cumulative_state:
                     st.json(cumulative_state, expanded=False)
+                if soil_cumulative_state:
+                    st.json(soil_cumulative_state, expanded=False)
             except ValueError as e:
                 st.error(str(e))
                 st.stop()
@@ -130,6 +141,7 @@ with st.sidebar:
         "- 運送數量：優先採用「實際出土量」，缺值則用「載運土方量」\n"
         "- 月報表的憑證序號會自動省略共同前綴，只顯示後4碼「起始 ~ 結束」\n"
         "- 重複上傳過的聯單序號不會被重複計入累計（但文件內容仍正常顯示）\n"
+        "- 每日出場紀錄會依聯單序號裡的土質代碼（如 B1、B2-3）自動分欄顯示運送數量、小計與累計\n"
     )
 
 uploaded_file = st.file_uploader("上傳聯單資料 CSV 檔", type=["csv"])
@@ -230,13 +242,15 @@ if exclude_map:
 if st.button("🚀 產生 Word 文件", type="primary"):
     with st.spinner("處理中..."):
         try:
-            outputs, summary, updated_state, excluded_log, updated_known_tickets, batch_dup_info = build_all_documents(
+            (outputs, summary, updated_state, excluded_log, updated_known_tickets,
+             batch_dup_info, updated_soil_state) = build_all_documents(
                 raw_df,
                 engineering_name_override=engineering_name_override.strip(),
                 monthly_cumulative_start=monthly_cumulative_start,
                 cumulative_state=cumulative_state,
                 exclude_map=exclude_map,
                 known_tickets=effective_known_tickets,
+                soil_cumulative_state=soil_cumulative_state,
             )
         except Exception as e:  # noqa: BLE001
             st.error(f"產生文件時發生錯誤：{e}")
@@ -257,6 +271,9 @@ if st.button("🚀 產生 Word 文件", type="primary"):
 
     st.subheader("📌 累計記錄")
     st.json(updated_state, expanded=False)
+    if updated_soil_state:
+        st.caption("各土質代碼累計（每日出場紀錄總計列使用）：")
+        st.json(updated_soil_state, expanded=False)
 
     problems = validate_cumulative_monotonic(updated_state)
     if problems:
@@ -268,9 +285,10 @@ if st.button("🚀 產生 Word 文件", type="primary"):
     elif sheets_enabled:
         try:
             sheets.save_cumulative_to_sheet(spreadsheet, updated_state)
+            sheets.save_soil_cumulative_to_sheet(spreadsheet, updated_soil_state)
             logged_count = sheets.log_excluded_tickets(spreadsheet, excluded_log)
             newly_tracked = sheets.save_processed_tickets(spreadsheet, updated_known_tickets, known_tickets)
-            msg = f"已自動寫回 Google 試算表「{sheets.CUMULATIVE_SHEET_NAME}」分頁"
+            msg = f"已自動寫回 Google 試算表「{sheets.CUMULATIVE_SHEET_NAME}」與「{sheets.SOIL_SHEET_NAME}」分頁"
             if logged_count:
                 msg += f"，新增 {logged_count} 筆異常退車紀錄"
             if newly_tracked:
@@ -280,8 +298,8 @@ if st.button("🚀 產生 Word 文件", type="primary"):
             st.error(f"寫入 Google 試算表失敗，請確認試算表已分享給服務帳號並給予編輯權限。錯誤訊息：{e}")
     else:
         st.download_button(
-            "⬇️ 下載本次記錄檔 (JSON，含累計與已處理聯單清單，下次上傳請記得帶上)",
-            data=dump_cumulative_state(updated_state, updated_known_tickets),
+            "⬇️ 下載本次記錄檔 (JSON，含累計/已處理聯單/土質累計，下次上傳請記得帶上)",
+            data=dump_cumulative_state(updated_state, updated_known_tickets, updated_soil_state),
             file_name="累計記錄.json",
             mime="application/json",
         )
@@ -292,7 +310,7 @@ if st.button("🚀 產生 Word 文件", type="primary"):
         for fname, doc in outputs.items():
             zf.writestr(fname, doc_to_bytes(doc))
         if not sheets_enabled:
-            zf.writestr("累計記錄.json", dump_cumulative_state(updated_state, updated_known_tickets))
+            zf.writestr("累計記錄.json", dump_cumulative_state(updated_state, updated_known_tickets, updated_soil_state))
     zip_buffer.seek(0)
 
     st.download_button(
