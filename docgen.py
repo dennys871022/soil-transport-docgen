@@ -17,6 +17,7 @@ from calendar import monthrange
 
 import pandas as pd
 from docx import Document
+from docx.oxml.ns import qn
 
 # ---------------------------------------------------------------------------
 # 常數設定
@@ -132,6 +133,7 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         return head or tail
 
     df["出場車號"] = df.apply(lambda r: combine_plate(r["出場車頭車號"], r["出場車斗車號"]), axis=1)
+    df["土質代碼"] = df["聯單序號"].apply(extract_soil_code)
     df["進場車號"] = df.apply(lambda r: combine_plate(r["進場車頭車號"], r["進場車斗車號"]), axis=1)
 
     # 依出場時間排序，車次才會照時間先後編號
@@ -180,6 +182,17 @@ def check_duplicates(df: pd.DataFrame, known_tickets: set = None) -> dict:
     return {"tickets": dup_tickets, "dates": dup_dates, "duplicate_qty": float(dup_qty)}
 
 
+def extract_soil_code(ticket) -> str:
+    """從聯單序號中取出土質代碼（中間那一段，例如 B1、B2-3、B4、B5）。
+    格式為 前綴_土質代碼_流水號，例如 EYG10099EYG21699_B2-3_00000001 -> 'B2-3'。
+    """
+    ticket = str(ticket)
+    parts = ticket.split("_")
+    if len(parts) >= 3:
+        return parts[-2]
+    return ""
+
+
 def shorten_ticket(ticket: str) -> str:
     """把單一聯單序號的流水號部分縮短成4位數。
     例如 'EYG10099EYG21699_B2-3_00000001' -> 'EYG10099EYG21699_B2-3_0001'
@@ -220,12 +233,13 @@ def format_ticket_range(tickets):
 
 def load_cumulative_state(file_obj) -> dict:
     """讀取先前下載的累計記錄 JSON 檔。
-    回傳 {"cumulative": {"YYYY-MM": 累計立方公尺,...}, "processed_tickets": [...已處理過的聯單序號...]}。
-    相容舊版格式（舊版檔案內容是單純的 {"YYYY-MM": 數字} 沒有 processed_tickets）。
+    回傳 {"cumulative": {"YYYY-MM": 累計立方公尺,...}, "processed_tickets": [...已處理過的聯單序號...],
+          "soil_cumulative": {"土質代碼": 累計立方公尺,...}}。
+    相容舊版格式（舊版檔案內容是單純的 {"YYYY-MM": 數字}，或是沒有 soil_cumulative 欄位）。
     """
     import json
     if file_obj is None:
-        return {"cumulative": {}, "processed_tickets": []}
+        return {"cumulative": {}, "processed_tickets": [], "soil_cumulative": {}}
     try:
         if hasattr(file_obj, "seek"):
             file_obj.seek(0)
@@ -236,20 +250,23 @@ def load_cumulative_state(file_obj) -> dict:
         if "cumulative" in data or "processed_tickets" in data:
             cumulative = {str(k): float(v) for k, v in (data.get("cumulative") or {}).items()}
             processed = list(data.get("processed_tickets") or [])
+            soil_cumulative = {str(k): float(v) for k, v in (data.get("soil_cumulative") or {}).items()}
         else:
             # 舊版格式：整份檔案就是 {"YYYY-MM": 數字}
             cumulative = {str(k): float(v) for k, v in data.items()}
             processed = []
-        return {"cumulative": cumulative, "processed_tickets": processed}
+            soil_cumulative = {}
+        return {"cumulative": cumulative, "processed_tickets": processed, "soil_cumulative": soil_cumulative}
     except Exception as e:  # noqa: BLE001
         raise ValueError(f"累計記錄檔格式錯誤，請確認是上次程式產生的 JSON 檔：{e}")
 
 
-def dump_cumulative_state(cumulative: dict, processed_tickets=None) -> str:
+def dump_cumulative_state(cumulative: dict, processed_tickets=None, soil_cumulative: dict = None) -> str:
     import json
     payload = {
         "cumulative": cumulative,
         "processed_tickets": sorted(set(processed_tickets or [])),
+        "soil_cumulative": soil_cumulative or {},
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -340,8 +357,62 @@ def _replace_in_paragraph(paragraph, key, val):
 # 1. 每日出場紀錄
 # ---------------------------------------------------------------------------
 
+def _add_soil_quantity_column(table, current_soil_col_count: int) -> int:
+    """在目前的土質欄位組最後面再加一欄（當一天出現超過預設3種土質代碼時使用）。
+    同步處理：欄寬定義(tblGrid)、標題列(擴大「運送數量」的合併範圍)、子標題列（複製「(土質)」儲存格）、
+    每一筆資料列（複製空白儲存格）、小計列（複製小計儲存格）、總計列（擴大文字儲存格的合併範圍）。
+    回傳新的土質欄位數量。
+    """
+    tbl = table._tbl
+    header_rows = 2
+    n_rows = len(table.rows)
+    subtotal_row_idx = n_rows - 2
+    total_row_idx = n_rows - 1
+
+    last_soil_logical_idx = 2 + current_soil_col_count  # col0車次,col1憑證,col2車牌，之後才是土質欄位
+
+    # 1. tblGrid：複製一個欄寬定義
+    grid = tbl.find(qn('w:tblGrid'))
+    gridcols = grid.findall(qn('w:gridCol'))
+    new_gridcol = copy.deepcopy(gridcols[last_soil_logical_idx])
+    gridcols[last_soil_logical_idx].addnext(new_gridcol)
+
+    # 2. row0（標題「運送數量(立方公尺)」合併儲存格）：gridSpan +1
+    row0_tcs = table.rows[0]._tr.findall(qn('w:tc'))
+    qty_tcPr = row0_tcs[3].find(qn('w:tcPr'))
+    gridspan_elem = qty_tcPr.find(qn('w:gridSpan'))
+    gridspan_elem.set(qn('w:val'), str(int(gridspan_elem.get(qn('w:val'))) + 1))
+
+    # 3. row1（子標題「(土質)」）：複製最後一個土質子標題儲存格
+    row1_tcs = table.rows[1]._tr.findall(qn('w:tc'))
+    src = row1_tcs[last_soil_logical_idx]
+    src.addnext(copy.deepcopy(src))
+
+    # 4. 每一筆資料列：複製最後一個土質儲存格（空白）
+    for ri in range(header_rows, subtotal_row_idx):
+        tcs = table.rows[ri]._tr.findall(qn('w:tc'))
+        src = tcs[last_soil_logical_idx]
+        src.addnext(copy.deepcopy(src))
+
+    # 5. 小計列：實際 tc 清單是 [小計(span3), 土質1, 土質2, ..., 其餘(span6)]
+    subtotal_tcs = table.rows[subtotal_row_idx]._tr.findall(qn('w:tc'))
+    src = subtotal_tcs[current_soil_col_count]  # 小計(span3)佔1個tc位置，所以索引=目前土質欄位數
+    src.addnext(copy.deepcopy(src))
+
+    # 6. 總計列：文字儲存格 gridSpan +1
+    total_tcs = table.rows[total_row_idx]._tr.findall(qn('w:tc'))
+    text_tcPr = total_tcs[1].find(qn('w:tcPr'))
+    gridspan2 = text_tcPr.find(qn('w:gridSpan'))
+    gridspan2.set(qn('w:val'), str(int(gridspan2.get(qn('w:val'))) + 1))
+
+    return current_soil_col_count + 1
+
+
 def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
-                           cumulative_before: float) -> Document:
+                           soil_cumulative_before: dict) -> Document:
+    """產生每日出場紀錄。soil_cumulative_before: {土質代碼: 累計到目前為止的立方公尺}（只會用到今天
+    有出現的代碼）。回傳 (doc, daily_total, soil_cumulative_after)。
+    """
     doc = Document(TEMPLATE_DAILY)
 
     engineering_name = engineering_name or (day_df["工程名稱"].iloc[0] if len(day_df) else "")
@@ -359,57 +430,97 @@ def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
 
     table = doc.tables[0]
     header_rows = 2
-    total_row_index = len(table.rows) - 1  # 目前總計列的位置
-    data_row_count = total_row_index - header_rows  # 目前模板內的資料列數（預設 5）
+    total_row_index = len(table.rows) - 1
+    subtotal_row_index = total_row_index - 1
+    data_row_count = subtotal_row_index - header_rows  # 預設 5
 
     n = len(day_df)
-    # 資料列數不夠 -> 在總計列之前插入新列（複製最後一列資料列的格式）
+    # 資料列數不夠 -> 在小計列之前插入新列
     while data_row_count < n:
-        _clone_row(table, total_row_index - 1, total_row_index)
+        _clone_row(table, subtotal_row_index - 1, subtotal_row_index)
+        subtotal_row_index += 1
         total_row_index += 1
         data_row_count += 1
 
+    # 今天出現過的土質代碼（含排除的，因為排除的那一列仍要正常顯示數量在對應欄位）
+    codes_today = sorted({c for c in day_df["土質代碼"].tolist() if c})
+    soil_col_count = max(3, len(codes_today))
+    current_cols = 3
+    while current_cols < soil_col_count:
+        current_cols = _add_soil_quantity_column(table, current_cols)
+
+    code_to_col = {code: 3 + i for i, code in enumerate(codes_today)}
+
+    # 填入子標題列的土質代碼
+    for code, col in code_to_col.items():
+        _set_cell_text(table.rows[1].cells[col], f"({code})")
+    for col in range(3 + len(codes_today), 3 + soil_col_count):
+        _set_cell_text(table.rows[1].cells[col], "(土質)")
+
+    check_col_start = 3 + soil_col_count
+    c_check = list(range(check_col_start, check_col_start + 4))
+    c_out_time = check_col_start + 4
+    c_driver = check_col_start + 5
+    total_cols = check_col_start + 6  # 整列總欄數
+
     daily_total = 0.0
-    cumulative_delta = 0.0
+    soil_subtotal_today = {code: 0.0 for code in codes_today}  # 今天各土質小計（不含排除）
+    soil_cumulative_delta = {code: 0.0 for code in codes_today}  # 今天要加進累計的量（不含排除、不含重複）
+
     for i in range(data_row_count):
         row = table.rows[header_rows + i]
         if i < n:
             r = day_df.iloc[i]
             qty = r["數量"]
-            if not r.get("排除", False):
+            code = r.get("土質代碼", "") or ""
+            is_excluded = bool(r.get("排除", False))
+            is_dup = bool(r.get("重複", False))
+
+            if not is_excluded:
                 daily_total += qty
-                if not r.get("重複", False):
-                    cumulative_delta += qty
+                if code in soil_subtotal_today:
+                    soil_subtotal_today[code] += qty
+                if not is_dup and code in soil_cumulative_delta:
+                    soil_cumulative_delta[code] += qty
+
             _set_cell_text(row.cells[0], str(i + 1))
             _set_cell_text(row.cells[1], shorten_ticket(r["聯單序號"]))
             _set_cell_text(row.cells[2], str(r["出場車號"]))
-            _set_cell_text(row.cells[3], f"{qty:g}")
+            for col in range(3, 3 + soil_col_count):
+                _set_cell_text(row.cells[col], "")
+            if code in code_to_col:
+                _set_cell_text(row.cells[code_to_col[code]], f"{qty:g}")
             # 4項檢查是出場當下的車輛/駕駛檢查，只要有出場紀錄就代表已通過檢查，
             # 跟後續是否異常退車（清運數量認定）無關，一律打勾
-            checked = "✓"
-            _set_cell_text(row.cells[4], checked)
-            _set_cell_text(row.cells[5], checked)
-            _set_cell_text(row.cells[6], checked)
-            _set_cell_text(row.cells[7], checked)
+            for cc in c_check:
+                _set_cell_text(row.cells[cc], "✓")
             out_time = r["出場日期時間"]
-            _set_cell_text(row.cells[8], out_time.strftime("%H:%M") if pd.notna(out_time) else "")
-            _set_cell_text(row.cells[9], str(r.get("司機姓名", "")))
+            _set_cell_text(row.cells[c_out_time], out_time.strftime("%H:%M") if pd.notna(out_time) else "")
+            _set_cell_text(row.cells[c_driver], str(r.get("司機姓名", "")))
         else:
-            # 多出來的空白列：保留車次編號，其餘留空
             _set_cell_text(row.cells[0], str(i + 1))
-            for c in range(1, 10):
+            for c in range(1, total_cols):
                 _set_cell_text(row.cells[c], "")
 
-    cumulative_after = cumulative_before + cumulative_delta
-    total_row = table.rows[total_row_index]
-    total_text = (
-        f"有價土石方運送數量    ：{daily_total:g}   立方公尺\n"
-        f"累計有價土石方運送數量：{cumulative_after:g}   立方公尺"
-    )
-    for c in range(3, 10):
-        _set_cell_text(total_row.cells[c], total_text)
+    # 小計列
+    subtotal_row = table.rows[subtotal_row_index]
+    for code, col in code_to_col.items():
+        _set_cell_text(subtotal_row.cells[col], f"{soil_subtotal_today[code]:g}")
 
-    return doc, daily_total, cumulative_after
+    # 累計：只累加今天有出現的土質代碼
+    soil_cumulative_after = dict(soil_cumulative_before)
+    for code in codes_today:
+        soil_cumulative_after[code] = soil_cumulative_before.get(code, 0.0) + soil_cumulative_delta[code]
+
+    total_row = table.rows[total_row_index]
+    parts = [
+        f"土質代碼{code}：{soil_cumulative_after[code]:g}立方公尺"
+        for code in codes_today
+    ]
+    total_text = "累計土方已運送數量：" + "；".join(parts)
+    _set_cell_text(total_row.cells[2], total_text)
+
+    return doc, daily_total, soil_cumulative_after
 
 
 # ---------------------------------------------------------------------------
@@ -595,8 +706,15 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
                          monthly_cumulative_start: float = 0.0,
                          cumulative_state: dict = None,
                          exclude_map: dict = None,
-                         known_tickets: set = None):
-    """回傳 (outputs, summary, updated_cumulative_state, excluded_log, updated_known_tickets, duplicate_info)。
+                         known_tickets: set = None,
+                         soil_cumulative_state: dict = None):
+    """回傳 (outputs, summary, updated_cumulative_state, excluded_log, updated_known_tickets,
+             duplicate_info, updated_soil_cumulative_state)。
+
+    soil_cumulative_state: {土質代碼: 累計到目前為止的立方公尺}，只用在「每日出場紀錄」最下面
+      的「累計土方已運送數量：土質代碼...」那一行。因為是用每張聯單是否重複(known_tickets)直接
+      判斷要不要計入，不是用月份加總，所以不會有「整批重傳舊資料污染歷史」的風險，可以放心重傳。
+      統計月報表、運送時間一覽表不受這個欄位影響，仍然是用合計總量（不分土質）。
 
     cumulative_state: {"YYYY-MM": 累計到該月月底為止的立方公尺總量}。
       這是「整個工程從開始到現在」的累計，跨月會持續往上加、不會每月重新歸零
@@ -628,6 +746,7 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
     outputs = {}
     summary = []
     cumulative_state = dict(cumulative_state or {})
+    soil_cumulative_state = dict(soil_cumulative_state or {})
 
     excluded_log = []
     for _, r in df[df["排除"]].iterrows():
@@ -695,7 +814,12 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
         period = pd.Period(year=d.year, month=d.month, freq="M")
 
         cum_before = running_by_period.get(period, period_start_cumulative[period])
-        doc_daily, daily_total, cum_after = generate_daily_record(day_df, d, eng_name, cum_before)
+        doc_daily, daily_total, soil_cum_after = generate_daily_record(day_df, d, eng_name, soil_cumulative_state)
+        soil_cumulative_state.update(soil_cum_after)
+        # 每日出場紀錄文件本身改成土質分開顯示累計，但「跨月合計累計」仍然要往下走，
+        # 供統計月報表使用（算法跟土質累計一樣：排除的不算、重複的不算，只是不分土質）
+        day_cumulative_delta = day_df[(~day_df["排除"]) & (~day_df["重複"])]["數量"].sum()
+        cum_after = cum_before + day_cumulative_delta
         running_by_period[period] = cum_after
 
         fname_daily = f"每日出場紀錄_{d.strftime('%Y%m%d')}.docx"
@@ -730,7 +854,8 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
 
     updated_known_tickets = known_tickets | set(df["聯單序號"].astype(str).tolist())
 
-    return outputs, summary, cumulative_state, excluded_log, updated_known_tickets, duplicate_info
+    return (outputs, summary, cumulative_state, excluded_log, updated_known_tickets,
+            duplicate_info, soil_cumulative_state)
 
 
 def doc_to_bytes(doc: Document) -> bytes:
