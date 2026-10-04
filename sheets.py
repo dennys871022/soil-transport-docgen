@@ -37,6 +37,11 @@ EXCLUDED_HEADER = ["日期", "聯單序號", "車號", "原因", "數量(m3)", "
 PROCESSED_SHEET_NAME = "已處理聯單"
 PROCESSED_HEADER = ["聯單序號", "記錄時間"]
 
+SOIL_SHEET_NAME = "土質累計"
+SOIL_HEADER = ["土質代碼", "累計立方公尺", "最後更新時間"]
+# 這是每日出場紀錄最下面「累計土方已運送數量：土質代碼...」那一行用的累計，
+# 是用聯單序號逐張判斷是否重複(不是用月份)，所以重傳舊資料不會有污染風險，可以放心重傳。
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -209,6 +214,48 @@ def log_excluded_tickets(spreadsheet, excluded_log: list):
     if rows_to_add:
         ws.append_rows(rows_to_add)
     return len(rows_to_add)
+
+
+def load_soil_cumulative_from_sheet(spreadsheet) -> dict:
+    """從「土質累計」分頁讀取各土質代碼目前的累計立方公尺，回傳 {"土質代碼": 數字}。"""
+    ws = _get_or_create_worksheet(spreadsheet, SOIL_SHEET_NAME, SOIL_HEADER)
+    records = _get_all_records_safe(ws, SOIL_HEADER)
+    result = {}
+    for r in records:
+        code = str(r.get("土質代碼", "")).strip()
+        if not code:
+            continue
+        try:
+            result[code] = float(r.get("累計立方公尺", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def save_soil_cumulative_to_sheet(spreadsheet, soil_state: dict):
+    """把更新過的土質累計狀態寫回「土質累計」分頁（該代碼已存在就更新，不存在就新增一列）。"""
+    ws = _get_or_create_worksheet(spreadsheet, SOIL_SHEET_NAME, SOIL_HEADER)
+    records = _get_all_records_safe(ws, SOIL_HEADER)
+    existing_row_of = {}
+    for idx, r in enumerate(records):
+        code = str(r.get("土質代碼", "")).strip()
+        if code:
+            existing_row_of[code] = idx + 2
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    updates = []
+    appends = []
+    for code, total in soil_state.items():
+        if code in existing_row_of:
+            row_no = existing_row_of[code]
+            updates.append({"range": f"B{row_no}:C{row_no}", "values": [[total, now_str]]})
+        else:
+            appends.append([code, total, now_str])
+
+    if updates:
+        ws.batch_update(updates)
+    if appends:
+        ws.append_rows(appends)
 
 
 def load_processed_tickets(spreadsheet) -> set:
