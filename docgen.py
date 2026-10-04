@@ -18,6 +18,7 @@ from calendar import monthrange
 import pandas as pd
 from docx import Document
 from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 # ---------------------------------------------------------------------------
 # 常數設定
@@ -856,6 +857,48 @@ def build_all_documents(df: pd.DataFrame, engineering_name_override: str = "",
 
     return (outputs, summary, cumulative_state, excluded_log, updated_known_tickets,
             duplicate_info, soil_cumulative_state)
+
+
+def merge_docs_with_page_breaks(ordered_docs: list) -> Document:
+    """把多份 Document 合併成一份，每一份之間強制分頁（新的一天從新的一頁開始）。
+    ordered_docs 必須已經按照想要的順序排好（例如依日期由小到大）。
+
+    做法：在每一份新內容的「第一個段落」設定 pageBreakBefore 屬性，而不是另外插入一個
+    換頁符號段落，這樣才不會因為多一個空段落而產生多餘的空白頁。
+    """
+    if not ordered_docs:
+        raise ValueError("沒有文件可以合併")
+
+    base = ordered_docs[0]
+    base_body = base.element.body
+    base_sectPr = base_body.find(qn('w:sectPr'))
+
+    for doc in ordered_docs[1:]:
+        src_body = doc.element.body
+        children = [c for c in src_body if c.tag != qn('w:sectPr')]
+        if not children:
+            continue
+
+        first_copied = None
+        for child in children:
+            new_child = copy.deepcopy(child)
+            if first_copied is None:
+                first_copied = new_child
+            if base_sectPr is not None:
+                base_sectPr.addprevious(new_child)
+            else:
+                base_body.append(new_child)
+
+        # 在這份文件複製進來的第一個元素上設定「段落前強制分頁」
+        if first_copied is not None and first_copied.tag == qn('w:p'):
+            pPr = first_copied.find(qn('w:pPr'))
+            if pPr is None:
+                pPr = OxmlElement('w:pPr')
+                first_copied.insert(0, pPr)
+            if pPr.find(qn('w:pageBreakBefore')) is None:
+                pPr.insert(0, OxmlElement('w:pageBreakBefore'))
+
+    return base
 
 
 def doc_to_bytes(doc: Document) -> bytes:
