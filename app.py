@@ -306,51 +306,76 @@ if st.button("🚀 產生 Word 文件", type="primary"):
             mime="application/json",
         )
 
-    # 打包成 zip 供一次下載
+    # 合併成單一檔案（每日出場紀錄、運送時間一覽表各自合併，換日期強制分頁）
+    daily_keys = sorted(k for k in outputs if k.startswith("每日出場紀錄"))
+    time_keys = sorted(k for k in outputs if k.startswith("運送時間一覽表"))
+
+    merged_daily_bytes = None
+    merged_time_bytes = None
+    merged_daily_name = None
+    merged_time_name = None
+
+    if len(daily_keys) > 1:
+        daily_docs = [DocxDocument(io.BytesIO(doc_to_bytes(outputs[k]))) for k in daily_keys]
+        merged_daily = merge_docs_with_page_breaks(daily_docs)
+        buf = io.BytesIO()
+        merged_daily.save(buf)
+        merged_daily_bytes = buf.getvalue()
+        merged_daily_name = (
+            f"每日出場紀錄_合併_"
+            f"{daily_keys[0].split('_')[-1].replace('.docx','')}-"
+            f"{daily_keys[-1].split('_')[-1].replace('.docx','')}.docx"
+        )
+
+    if len(time_keys) > 1:
+        time_docs = [DocxDocument(io.BytesIO(doc_to_bytes(outputs[k]))) for k in time_keys]
+        merged_time = merge_docs_with_page_breaks(time_docs)
+        buf = io.BytesIO()
+        merged_time.save(buf)
+        merged_time_bytes = buf.getvalue()
+        merged_time_name = (
+            f"運送時間一覽表_合併_"
+            f"{time_keys[0].split('_')[-1].replace('.docx','')}-"
+            f"{time_keys[-1].split('_')[-1].replace('.docx','')}.docx"
+        )
+
+    # 打包成 zip 供一次下載（含合併檔案）
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname, doc in outputs.items():
             zf.writestr(fname, doc_to_bytes(doc))
+        if merged_daily_bytes is not None:
+            zf.writestr(merged_daily_name, merged_daily_bytes)
+        if merged_time_bytes is not None:
+            zf.writestr(merged_time_name, merged_time_bytes)
         if not sheets_enabled:
             zf.writestr("累計記錄.json", dump_cumulative_state(updated_state, updated_known_tickets, updated_soil_state))
     zip_buffer.seek(0)
 
     st.download_button(
-        "⬇️ 下載全部檔案 (ZIP)",
+        "⬇️ 下載全部檔案 (ZIP，含合併檔案)",
         data=zip_buffer,
         file_name="土石方報表輸出.zip",
         mime="application/zip",
         type="primary",
     )
 
-    # 合併成單一檔案（每日出場紀錄、運送時間一覽表各自合併，換日期強制分頁）
-    daily_keys = sorted(k for k in outputs if k.startswith("每日出場紀錄"))
-    time_keys = sorted(k for k in outputs if k.startswith("運送時間一覽表"))
-
-    if len(daily_keys) > 1 or len(time_keys) > 1:
-        st.subheader("📎 合併成單一檔案")
+    if merged_daily_bytes is not None or merged_time_bytes is not None:
+        st.subheader("📎 合併成單一檔案（也已包含在上面的 ZIP 裡）")
         st.caption("把所有日期的文件合併成一份 Word 檔，換日期會強制從新的一頁開始。")
         col_m1, col_m2 = st.columns(2)
-        if len(daily_keys) > 1:
-            daily_docs = [DocxDocument(io.BytesIO(doc_to_bytes(outputs[k]))) for k in daily_keys]
-            merged_daily = merge_docs_with_page_breaks(daily_docs)
-            merged_daily_bytes = io.BytesIO()
-            merged_daily.save(merged_daily_bytes)
+        if merged_daily_bytes is not None:
             col_m1.download_button(
                 f"⬇️ 合併每日出場紀錄（共{len(daily_keys)}天）",
-                data=merged_daily_bytes.getvalue(),
-                file_name=f"每日出場紀錄_合併_{daily_keys[0].split('_')[-1].replace('.docx','')}-{daily_keys[-1].split('_')[-1].replace('.docx','')}.docx",
+                data=merged_daily_bytes,
+                file_name=merged_daily_name,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
-        if len(time_keys) > 1:
-            time_docs = [DocxDocument(io.BytesIO(doc_to_bytes(outputs[k]))) for k in time_keys]
-            merged_time = merge_docs_with_page_breaks(time_docs)
-            merged_time_bytes = io.BytesIO()
-            merged_time.save(merged_time_bytes)
+        if merged_time_bytes is not None:
             col_m2.download_button(
                 f"⬇️ 合併運送時間一覽表（共{len(time_keys)}天）",
-                data=merged_time_bytes.getvalue(),
-                file_name=f"運送時間一覽表_合併_{time_keys[0].split('_')[-1].replace('.docx','')}-{time_keys[-1].split('_')[-1].replace('.docx','')}.docx",
+                data=merged_time_bytes,
+                file_name=merged_time_name,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
 
