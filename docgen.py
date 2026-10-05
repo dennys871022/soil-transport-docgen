@@ -423,10 +423,11 @@ def generate_daily_record(day_df: pd.DataFrame, date, engineering_name: str,
             _replace_in_paragraph(p, p.text, f"工程名稱：{engineering_name}")
         if p.text.startswith("施工廠商："):
             _replace_in_paragraph(p, p.text, f"施工廠商：{CONTRACTOR_NAME}")
-        if p.text.startswith("出埸日期："):
+        if p.text.startswith("出場日期：") or p.text.startswith("出埸日期："):
+            label = p.text[:5]  # 保留樣板原本用的是「出場」還是「出埸」
             _replace_in_paragraph(
                 p, p.text,
-                f"出埸日期：{date.year - 1911:>3}年{date.month:>2}月{date.day:>2}日"
+                f"{label}{date.year - 1911:>3}年{date.month:>2}月{date.day:>2}日"
             )
 
     table = doc.tables[0]
